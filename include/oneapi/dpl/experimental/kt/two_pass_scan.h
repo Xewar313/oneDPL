@@ -151,13 +151,13 @@ sub_group_scan_partial(const SubGroup& sub_group, ValueType& value, BinaryOp bin
 
 // Named two_pass_scan for now to avoid name clash with single pass KT
 template <bool IsInclusive, typename _KernelName, typename _InRng, typename _OutRng, typename BinaryOp, typename UnaryOp,
-          typename ValueType>
+          typename InitType>
 void
 two_pass_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __out_rng,
-              BinaryOp binary_op, UnaryOp unary_op, ValueType init)
+              BinaryOp binary_op, UnaryOp unary_op, InitType init)
 {
     using namespace sycl;
-
+    using ValueType = oneapi::dpl::__internal::__value_t<_InRng>;
     // PVC 1 tile
     constexpr std::uint32_t log2_VL = 5;
     constexpr std::uint32_t VL = 1 << log2_VL;               // simd vector length 2^5 = 32
@@ -380,20 +380,6 @@ two_pass_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __out_rng,
 
                 // propogate carry in from previous block
                 oneapi::dpl::__internal::__lazy_ctor_storage<ValueType> sub_group_carry;
-                if (b == 0)
-                    sub_group_carry.__setup(init);
-                else
-                {
-                    if constexpr (IsInclusive)
-                        sub_group_carry.__setup(__out_rng[b * blockSize - 1]);
-                    else // The last block wrote an exclusive result, so we must make it inclusive.
-                    {
-                        // Grab the last element from the previous block that has been cached in temporary
-                        // storage in the second kernel of the previous block.
-                        ValueType last_block_element = unary_op(tmp_storage[num_sub_groups_global]);
-                        sub_group_carry.__setup(binary_op(__out_rng[b * blockSize - 1], last_block_element));
-                    }
-                }
 
                 // on the first sub-group in a work-group (assuming S subgroups in a work-group):
                 // 1. load S sub-group local carry pfix sums (T0..TS-1) to slm
@@ -517,21 +503,71 @@ two_pass_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __out_rng,
                 ndi.barrier(sycl::access::fence_space::local_space);
 
                 // Get inter-work group and adjusted for intra-work group prefix
-                if (sub_group_id > 0)
+                bool sub_group_carry_initialized = true;
+                if (b == 0)
                 {
-                    if (sub_group_local_id == 0)
-                    {
-                        sub_group_carry.__v = binary_op(sub_group_carry.__v, sub_group_partials[sub_group_id - 1]);
+                    if (sub_group_id > 0)
+                    {   
+                        auto value = sub_group_partials[sub_group_id - 1];
+                        oneapi::dpl::unseq_backend::__init_processing<ValueType>{}(init, value, binary_op);
+                        sub_group_carry.__setup(value);
                     }
-                    sub_group_carry.__v = sycl::group_broadcast(sub_group, sub_group_carry.__v, 0);
+                    else if (g > 0)
+                    {
+                        auto value = sub_group_partials[active_subgroups];
+                        oneapi::dpl::unseq_backend::__init_processing<ValueType>{}(init, value, binary_op);
+                        sub_group_carry.__setup(value);
+                    }
+                    else
+                    {
+                        if constexpr (std::is_void_v<typename InitType::__value_type>)
+                        {
+                            sub_group_carry_initialized = false;
+                        }
+                        else
+                        {
+                            sub_group_carry.__setup(init.__value);
+                        }
+                    }
                 }
-                else if (g > 0)
+                else
                 {
-                    if (sub_group_local_id == 0)
+                    if (sub_group_id > 0)
                     {
-                        sub_group_carry.__v = binary_op(sub_group_carry.__v, sub_group_partials[active_subgroups]);
+                        if constexpr (IsInclusive)
+                            sub_group_carry.__setup(binary_op(__out_rng[b * blockSize - 1], sub_group_partials[sub_group_id - 1]));
+                        else // The last block wrote an exclusive result, so we must make it inclusive.
+                        {
+                            // Grab the last element from the previous block that has been cached in temporary
+                            // storage in the second kernel of the previous block.
+                            ValueType last_block_element = unary_op(tmp_storage[num_sub_groups_global]);
+                            sub_group_carry.__setup(binary_op(binary_op(__out_rng[b * blockSize - 1], last_block_element), sub_group_partials[sub_group_id - 1]));
+                        }
                     }
-                    sub_group_carry.__v = sycl::group_broadcast(sub_group, sub_group_carry.__v, 0);
+                    else if (g > 0)
+                    {    
+                        if constexpr (IsInclusive)
+                            sub_group_carry.__setup(binary_op(__out_rng[b * blockSize - 1], sub_group_partials[active_subgroups]));
+                        else // The last block wrote an exclusive result, so we must make it inclusive.
+                        {
+                            // Grab the last element from the previous block that has been cached in temporary
+                            // storage in the second kernel of the previous block.
+                            ValueType last_block_element = unary_op(tmp_storage[num_sub_groups_global]);
+                            sub_group_carry.__setup(binary_op(binary_op(__out_rng[b * blockSize - 1], last_block_element), sub_group_partials[active_subgroups]));
+                        }
+                    }
+                    else
+                    {
+                        if constexpr (IsInclusive)
+                            sub_group_carry.__setup(__out_rng[b * blockSize - 1]);
+                        else // The last block wrote an exclusive result, so we must make it inclusive.
+                        {
+                            // Grab the last element from the previous block that has been cached in temporary
+                            // storage in the second kernel of the previous block.
+                            ValueType last_block_element = unary_op(tmp_storage[num_sub_groups_global]);
+                            sub_group_carry.__setup(binary_op(__out_rng[b * blockSize - 1], last_block_element));
+                        }
+                    }
                 }
 
                 // step 5) apply global carries
@@ -539,51 +575,122 @@ two_pass_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __out_rng,
                 bool is_full_thread = subgroup_start_idx + J * VL <= M;
                 size_t start_idx = subgroup_start_idx + sub_group_local_id;
 
-                if (is_full_thread && is_full_block)
+                if (sub_group_carry_initialized)
                 {
-                    _ONEDPL_PRAGMA_UNROLL
-                    for (int j = 0; j < J_max; j++)
+                    if (is_full_thread && is_full_block)
                     {
-                        auto v = unary_op(__in_rng[start_idx + j * VL]);
-                        // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
-                        sub_group_scan<VL, IsInclusive, true>(sub_group, v, binary_op, sub_group_carry);
-                        __out_rng[start_idx + j * VL] = v;
-                    }
-                }
-                else if (is_full_thread)
-                {
-                    for (int j = 0; j < J; j++)
-                    {
-                        auto v = unary_op(__in_rng[start_idx + j * VL]);
-                        // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
-                        sub_group_scan<VL, IsInclusive, true>(sub_group, v, binary_op, sub_group_carry);
-                        __out_rng[start_idx + j * VL] = v;
-                    }
-                }
-                else
-                {
-                    if (sub_group_id < active_subgroups)
-                    {
-                        auto iters = oneapi::dpl::__internal::__dpl_ceiling_div(M - subgroup_start_idx, VL);
-                        for (int j = 0; j < iters - 1; j++)
+                        _ONEDPL_PRAGMA_UNROLL
+                        for (int j = 0; j < J_max; j++)
                         {
-                            auto local_idx = start_idx + j * VL;
+                            auto v = unary_op(__in_rng[start_idx + j * VL]);
+                            // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
+                            sub_group_scan<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry);
+                            __out_rng[start_idx + j * VL] = v;
+                        }
+                    }
+                    else if (is_full_thread)
+                    {
+                        for (int j = 0; j < J; j++)
+                        {
+                            auto v = unary_op(__in_rng[start_idx + j * VL]);
+                            // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
+                            sub_group_scan<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry);
+                            __out_rng[start_idx + j * VL] = v;
+                        }
+                    }
+                    else
+                    {
+                        if (sub_group_id < active_subgroups)
+                        {
+                            auto iters = oneapi::dpl::__internal::__dpl_ceiling_div(M - subgroup_start_idx, VL);
+                            for (int j = 0; j < iters - 1; j++)
+                            {
+                                auto local_idx = start_idx + j * VL;
+                                auto v = unary_op(__in_rng[local_idx]);
+                                // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
+                                sub_group_scan<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry);
+                                __out_rng[local_idx] = v;
+                            }
+
+                            auto offset = start_idx + (iters - 1) * VL;
+                            auto local_idx = (offset < M) ? offset : M - 1;
                             auto v = unary_op(__in_rng[local_idx]);
                             // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
-                            sub_group_scan<VL, IsInclusive, true>(sub_group, v, binary_op, sub_group_carry);
-                            __out_rng[local_idx] = v;
+                            sub_group_scan_partial<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry, M - (subgroup_start_idx + (iters - 1) * VL));
+                            if (offset < M)
+                                __out_rng[offset] = v;
                         }
+                    }
+                    sub_group_carry.__destroy();
+                }
+                else // first group first block, no subgroup carry
+                {
+                    if (is_full_thread && is_full_block)
+                    {
+                        auto v = unary_op(__in_rng[start_idx]);
+                        sub_group_scan<VL, IsInclusive, /*InitPresent=*/false>(sub_group, v, binary_op, sub_group_carry);
+                        __out_rng[start_idx] = v;
 
-                        auto offset = start_idx + (iters - 1) * VL;
-                        auto local_idx = (offset < M) ? offset : M - 1;
-                        auto v = unary_op(__in_rng[local_idx]);
-                        // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
-                        sub_group_scan_partial<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry, M - (subgroup_start_idx + (iters - 1) * VL));
-                        if (offset < M)
-                            __out_rng[offset] = v;
+                        _ONEDPL_PRAGMA_UNROLL
+                        for (int j = 1; j < J_max; j++)
+                        {
+                            v = unary_op(__in_rng[start_idx + j * VL]);
+                            sub_group_scan<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry);
+                            __out_rng[start_idx + j * VL] = v;
+                        }
+                    }
+                    else if (is_full_thread)
+                    {
+                        auto v = unary_op(__in_rng[start_idx]);
+                        sub_group_scan<VL, IsInclusive, /*InitPresent=*/false>(sub_group, v, binary_op, sub_group_carry);
+                        __out_rng[start_idx] = v;
+
+                        for (int j = 1; j < J; j++)
+                        {
+                            v = unary_op(__in_rng[start_idx + j * VL]);
+                            sub_group_scan<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry);
+                            __out_rng[start_idx + j * VL] = v;
+                        }
+                    }
+                    else
+                    {
+                        if (sub_group_id < active_subgroups)
+                        {
+                            auto iters = oneapi::dpl::__internal::__dpl_ceiling_div(M - subgroup_start_idx, VL);
+
+                            if (iters == 1)
+                            {
+                                auto v = unary_op(__in_rng[start_idx]);
+                                // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
+                                sub_group_scan_partial<VL, IsInclusive, /*InitPresent=*/false>(sub_group, v, binary_op, sub_group_carry, M - subgroup_start_idx);
+                                if (start_idx < M)
+                                    __out_rng[start_idx] = v;
+                            }
+                            else
+                            {
+                                auto v = unary_op(__in_rng[start_idx]);
+                                // In principle we could use SYCL group scan. Stick to our own for now for full control of implementation.
+                                sub_group_scan<VL, IsInclusive, /*InitPresent=*/false>(sub_group, v, binary_op, sub_group_carry);
+                                __out_rng[start_idx] = v;
+
+                                    for (int j = 1; j < iters - 1; j++)
+                                    {
+                                        auto local_idx = start_idx + j * VL;
+                                        v = unary_op(__in_rng[local_idx]);
+                                        sub_group_scan<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry);
+                                        __out_rng[local_idx] = v;
+                                    }
+
+                                    auto offset = start_idx + (iters - 1) * VL;
+                                    auto local_idx = (offset < M) ? offset : M - 1;
+                                    v = unary_op(__in_rng[local_idx]);
+                                    sub_group_scan_partial<VL, IsInclusive, /*InitPresent=*/true>(sub_group, v, binary_op, sub_group_carry, M - (subgroup_start_idx + (iters - 1) * VL));
+                                    if (offset < M)
+                                        __out_rng[offset] = v;
+                            }
+                        }
                     }
                 }
-                sub_group_carry.__destroy();
             });
         });
         // Resize K and J for the last block
@@ -615,7 +722,7 @@ two_pass_transform_exclusive_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __
     auto __in_view = oneapi::dpl::__ranges::views::all(std::forward<_InRng>(__in_rng));
     auto __out_view = oneapi::dpl::__ranges::views::all(std::forward<_OutRng>(__out_rng));
 
-    __impl::two_pass_scan<false, _KernelName>(q, std::move(__in_view), std::move(__out_view), binary_op, unary_op, init);
+    __impl::two_pass_scan<false, _KernelName>(q, std::move(__in_view), std::move(__out_view), binary_op, unary_op, oneapi::dpl::unseq_backend::__init_value<ValueType>{init});
 }
 
 template <typename _KernelName, typename _InRng, typename _OutRng, typename BinaryOp,  typename UnaryOp, typename ValueType>
@@ -626,7 +733,18 @@ two_pass_transform_inclusive_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __
     auto __in_view = oneapi::dpl::__ranges::views::all(std::forward<_InRng>(__in_rng));
     auto __out_view = oneapi::dpl::__ranges::views::all(std::forward<_OutRng>(__out_rng));
 
-    __impl::two_pass_scan<true, _KernelName>(q, std::move(__in_view), std::move(__out_view), binary_op, unary_op, init);
+    __impl::two_pass_scan<true, _KernelName>(q, std::move(__in_view), std::move(__out_view), binary_op, unary_op, oneapi::dpl::unseq_backend::__init_value<ValueType>{init});
+}
+
+template <typename _KernelName, typename _InRng, typename _OutRng, typename BinaryOp,  typename UnaryOp>
+void
+two_pass_transform_inclusive_scan(sycl::queue q, _InRng&& __in_rng, _OutRng&& __out_rng,
+                        BinaryOp binary_op, UnaryOp unary_op)
+{
+    auto __in_view = oneapi::dpl::__ranges::views::all(std::forward<_InRng>(__in_rng));
+    auto __out_view = oneapi::dpl::__ranges::views::all(std::forward<_OutRng>(__out_rng));
+
+    __impl::two_pass_scan<true, _KernelName>(q, std::move(__in_view), std::move(__out_view), binary_op, unary_op, oneapi::dpl::unseq_backend::__no_init_value{});
 }
 
 } // namespace ranges
@@ -644,6 +762,21 @@ two_pass_transform_inclusive_scan(sycl::queue q, InputIterator first, InputItera
     auto __buf2 = __keep2(result, result + __n);
 
     ranges::two_pass_transform_inclusive_scan<_KernelName>(q, __buf1.all_view(), __buf2.all_view(), binary_op, unary_op, init);
+}
+
+template <typename _KernelName = oneapi::dpl::execution::DefaultKernelName, typename InputIterator, typename OutputIterator, typename BinaryOp, typename UnaryOp>
+void
+two_pass_transform_inclusive_scan(sycl::queue q, InputIterator first, InputIterator last, OutputIterator result,
+                                  BinaryOp binary_op, UnaryOp unary_op)
+{
+    auto __n = last - first;
+
+    auto __keep1 = oneapi::dpl::__ranges::__get_sycl_range<__par_backend_hetero::access_mode::read, InputIterator>();
+    auto __buf1 = __keep1(first, last);
+    auto __keep2 = oneapi::dpl::__ranges::__get_sycl_range<__par_backend_hetero::access_mode::write, OutputIterator>();
+    auto __buf2 = __keep2(result, result + __n);
+
+    ranges::two_pass_transform_inclusive_scan<_KernelName>(q, __buf1.all_view(), __buf2.all_view(), binary_op, unary_op);
 }
 
 template <typename _KernelName = oneapi::dpl::execution::DefaultKernelName, typename InputIterator, typename OutputIterator, typename ValueType, typename BinaryOp, typename UnaryOp>
@@ -667,6 +800,14 @@ two_pass_inclusive_scan(sycl::queue q, InputIterator first, InputIterator last, 
                         BinaryOp binary_op, ValueType init)
 {
     two_pass_transform_inclusive_scan<_KernelName>(q, first, last, result, binary_op, oneapi::dpl::__internal::__no_op(), init);
+}
+
+template <typename _KernelName = oneapi::dpl::execution::DefaultKernelName, typename InputIterator, typename OutputIterator, typename BinaryOp>
+void
+two_pass_inclusive_scan(sycl::queue q, InputIterator first, InputIterator last, OutputIterator result,
+                        BinaryOp binary_op)
+{
+    two_pass_transform_inclusive_scan<_KernelName>(q, first, last, result, binary_op, oneapi::dpl::__internal::__no_op());
 }
 
 template <typename _KernelName = oneapi::dpl::execution::DefaultKernelName, typename InputIterator, typename OutputIterator, typename BinaryOp, typename ValueType>
