@@ -1143,7 +1143,7 @@ struct __early_exit_find_or
             if constexpr (_OrTagType{})
             {
                 // Share found into state between items in our group to early exit if something was found
-                __something_was_found = __dpl_sycl::__group_broadcast(__item_id.get_group(), __something_was_found);
+                __something_was_found = __dpl_sycl::__group_broadcast(__item_id.get_sub_group(), __something_was_found);
             }
         }
     }
