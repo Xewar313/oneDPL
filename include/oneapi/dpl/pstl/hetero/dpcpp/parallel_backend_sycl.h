@@ -1112,6 +1112,9 @@ struct __early_exit_find_or
         if (__wg_size - __leader < __shift)
             __shift = __wg_size - __leader;
 
+        _IterSize __group_broadcast_interval = __n_iter / 10;
+        __group_broadcast_interval = __group_broadcast_interval < 100 ? 100 : __group_broadcast_interval;
+
         bool __something_was_found = false;
         for (_IterSize __i = 0; !__something_was_found && __i < __n_iter; ++__i)
         {
@@ -1137,6 +1140,14 @@ struct __early_exit_find_or
                 // But break statement here shows poor perf in some cases.
                 // So we use bool variable state check in the for-loop header.
                 __something_was_found = true;
+            }
+
+            // This approach is applicable only for __parallel_or_tag (when we search for any matching data entry)
+            if constexpr (_OrTagType{})
+            {
+                // Share found into state between items in our group to early exit if something was found
+                if (__i > 0 && __i % __group_broadcast_interval == 0)
+                    __something_was_found = __dpl_sycl::__group_broadcast(__item_id.get_group(), __something_was_found);
             }
         }
     }
